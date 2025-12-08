@@ -12,8 +12,12 @@ import tempfile
 
 import torch.cuda
 from cutlass.cute.nvgpu.common import OpError
+from cutlass.base_dsl.common import DSLCudaRuntimeError, DSLBaseError
 
 from utils import set_seed, clear_l2_cache
+
+import os
+os.environ["CUDA_DRIVER_COMPAT"] = "1"
 
 try:
     from task import TestSpec
@@ -153,8 +157,11 @@ def _run_single_test(test: TestCase):
     try:
         submission_output = custom_kernel(_clone_data(data))
 
-    except OpError as E:
+    except (OpError, DSLCudaRuntimeError, DSLBaseError) as E:
         print(f"Encountered {E}", file=sys.stderr)
+        return False, str(E)
+    except Exception as E:
+        print(f"Encountered unexpected error: {E}", file=sys.stderr)
         return False, str(E)
     torch.cuda.synchronize()
     return check_implementation(data, submission_output)
@@ -221,10 +228,10 @@ def _compile_kernel_once():
         compile_kernel()
         torch.cuda.synchronize()
         return True, None
-    except OpError as E:
-        return False, f"Compilation failed: {E}"
+    except (OpError, DSLCudaRuntimeError, DSLBaseError) as E:
+        return False, f"Compilation failed: {str(E)}"
     except Exception as E:
-        return False, f"Compilation failed: {E}"
+        return False, f"Compilation failed: {str(E)}"
 
 
 def _run_single_benchmark(
@@ -244,16 +251,18 @@ def _run_single_benchmark(
     try:
         compile_kernel()
         torch.cuda.synchronize()
-    except OpError as E:
-        return f"Compilation failed: {E}"
+    except (OpError, DSLCudaRuntimeError, DSLBaseError) as E:
+        return f"Compilation failed: {str(E)}"
     except Exception as E:
-        return f"Compilation failed: {E}"
+        return f"Compilation failed: {str(E)}"
     
     #  first, one obligatory correctness check
     try:
         output = custom_kernel(_clone_data(data))
-    except OpError as E:
-        return f"Encountered {E}"
+    except (OpError, DSLCudaRuntimeError, DSLBaseError) as E:
+        return f"Encountered {str(E)}"
+    except Exception as E:
+        return f"Encountered unexpected error: {str(E)}"
     good, message = check_implementation(check_copy, output)
     if not good:
         return message
