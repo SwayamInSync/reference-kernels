@@ -674,25 +674,54 @@ torch::Tensor cuda_nvfp4_gemv(torch::Tensor A,
 """
 
 # ---- build the module ----
-nvfp4_module = load_inline(
-    name="nvfp4_gemv",
-    cpp_sources=[gemv_cpp],
-    cuda_sources=[gemv_cuda],
-    functions=["cuda_nvfp4_gemv"],  # this exposes the function to Python
-    extra_cuda_cflags=[
-        "-std=c++17",
-        "-gencode=arch=compute_100a,code=sm_100a",
-        "--ptxas-options=--gpu-name=sm_100a",
-        "-O3",
-        "-w",
-        "-maxrregcount=32",
-        "--use_fast_math",
-        "-allow-unsupported-compiler",
-    ],
-    extra_ldflags=["-lcuda", "-lcublas"],
-    verbose=True,
-)
+
+
+
+# def custom_kernel(data: input_t) -> output_t:
+#     return nvfp4_module.cuda_nvfp4_gemv(data[0], data[1], data[6], data[2], data[3])
+
+
+import io
+import sys
+
+_nvfp4_blockscaled = None
+
+def _get_kernel():
+    global _nvfp4_blockscaled
+    if _nvfp4_blockscaled is None:
+        # Save and restore stdout/stderr to handle multiprocessing issues
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        if sys.stdout is None:
+            sys.stdout = io.StringIO()
+        if sys.stderr is None:
+            sys.stderr = io.StringIO()
+        try:
+            _nvfp4_blockscaled = load_inline(
+                            name="nvfp4_gemv",
+                            cpp_sources=[gemv_cpp],
+                            cuda_sources=[gemv_cuda],
+                            functions=["cuda_nvfp4_gemv"],  # this exposes the function to Python
+                            extra_cuda_cflags=[
+                                "-std=c++17",
+                                "-gencode=arch=compute_100a,code=sm_100a",
+                                "--ptxas-options=--gpu-name=sm_100a",
+                                "-O3",
+                                "-w",
+                                "-maxrregcount=32",
+                                "--use_fast_math",
+                                "-allow-unsupported-compiler",
+                            ],
+                            extra_ldflags=["-lcuda"],
+                            verbose=False,
+                        )
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+    return _nvfp4_blockscaled
 
 
 def custom_kernel(data: input_t) -> output_t:
-    return nvfp4_module.cuda_nvfp4_gemv(data[0], data[1], data[6], data[2], data[3])
+    a, b, sfa, sfb, _, _, c = data
+    kernel = _get_kernel()
+    return kernel.cuda_nvfp4_gemv(a, b, c, sfa, sfb)
