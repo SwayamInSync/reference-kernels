@@ -22,6 +22,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <iostream>
+#include <mutex>
 
 // Helper macros for error checking
 #define checkCublasStatus(status) do { \
@@ -43,67 +44,16 @@ __host__ __device__ inline int ceilDiv(int a, int b) {
     return (a + b - 1) / b;
 }
 
-// Kernel to convert scale factors from [rows, cols] to cuBLAS blocked format
-// The blocked format is: view as [n_row_blocks, 128, n_col_blocks, 4]
-//                        permute to [n_row_blocks, n_col_blocks, 128, 4]
-//                        reshape to [-1, 4, 32, 4], transpose to [-1, 32, 4, 4]
-//                        reshape to [-1, 32, 16] and flatten
-//
-// For input [rows, cols], n_row_blocks = ceil(rows/128), n_col_blocks = ceil(cols/4)
-// Output size: n_row_blocks * n_col_blocks * 128 * 4 = n_row_blocks * n_col_blocks * 512
-__global__ void convertScaleFactorsToBlocked(
-    const __nv_fp8_e4m3* __restrict__ input,  // [rows, cols] - row-major
-    __nv_fp8_e4m3* __restrict__ output,       // blocked format
-    int rows,
-    int cols)
-{
-    // Output layout: [n_row_blocks * n_col_blocks, 32, 16]
-    // After the full transformation, the mapping is:
-    // output[rb * n_col_blocks + cb, s32, s16] corresponds to:
-    //   s4_outer = s16 / 4
-    //   s4_inner = s16 % 4
-    //   row = rb * 128 + s4_outer * 4 + s32
-    //   col = cb * 4 + s4_inner
-    // But s32 goes 0..31 for s4_outer=0, then 0..31 for s4_outer=1, etc.
-    // Actually the reshape is: [-1, 4, 32, 4] -> transpose(1,2) -> [-1, 32, 4, 4] -> reshape [-1, 32, 16]
-    // So s16 = s4_outer * 4 + s4_inner where s4_outer is the original axis 1 (range 0-3)
-    // and s4_inner is axis 3 (range 0-3)
-    // row in input = rb * 128 + s4_outer * 32 + s32
-    // col in input = cb * 4 + s4_inner
-    
-    int n_row_blocks = ceilDiv(rows, 128);
-    int n_col_blocks = ceilDiv(cols, 4);
-    int total_output = n_row_blocks * n_col_blocks * 32 * 16;
-    
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_output) return;
-    
-    // Decode output index
-    int s16 = idx % 16;
-    int s32 = (idx / 16) % 32;
-    int block_idx = idx / (32 * 16);
-    int rb = block_idx / n_col_blocks;
-    int cb = block_idx % n_col_blocks;
-    
-    // Map s16 back to s4_outer and s4_inner
-    int s4_outer = s16 / 4;
-    int s4_inner = s16 % 4;
-    
-    // Calculate input coordinates
-    int row = rb * 128 + s4_outer * 32 + s32;
-    int col = cb * 4 + s4_inner;
-    
-    // Read from input (with bounds check for padding)
-    __nv_fp8_e4m3 val;
-    if (row < rows && col < cols) {
-        val = input[row * cols + col];
-    } else {
-        // Pad with 1.0 (scale factor of 1 means no scaling)
-        // FP8 E4M3: 1.0 = 0x38 (sign=0, exp=0111, mantissa=000)
-        val = *reinterpret_cast<const __nv_fp8_e4m3*>(&(uint8_t){0x38});
-    }
-    
-    output[idx] = val;
+// Global cached resources for performance
+static cublasLtHandle_t g_ltHandle = nullptr;
+static void* g_workspace = nullptr;
+static size_t g_workspaceSize = 32 * 1024 * 1024;
+static std::once_flag g_init_flag;
+
+// Initialize global resources (called once)
+static void initGlobalResources() {
+    checkCublasStatus(cublasLtCreate(&g_ltHandle));
+    checkCudaStatus(cudaMalloc(&g_workspace, g_workspaceSize));
 }
 
 // cuBLASLt NVFP4 matmul wrapper
@@ -120,6 +70,7 @@ __global__ void convertScaleFactorsToBlocked(
 // and B_cublas is our A[M,K/2] (so K,M in colmaj), not transposed -> K,M
 // Result: C_colmaj = (N,K) @ (K,M) = (N,M)
 // In row-major this is [M,N] - our desired output!
+
 void LtNvfp4Matmul(cublasLtHandle_t ltHandle,
                    int m,  // rows of logical A (our A matrix)
                    int n,  // rows of logical B (our B matrix)
@@ -196,110 +147,73 @@ void LtNvfp4Matmul(cublasLtHandle_t ltHandle,
     if (operationDesc) checkCublasStatus(cublasLtMatmulDescDestroy(operationDesc));
 }
 
-// Main entry point
+// Main entry point - accepts PRE-BLOCKED scale factors for fair comparison with CUTLASS
 // Input:
 //   A: [M, K/2, L] float4_e2m1fn_x2 (row-major, packed K)
 //   B: [N, K/2, L] float4_e2m1fn_x2 (row-major, packed K)
-//   SFA: [M, sf_K, L] or permuted format - scale factors for A
-//   SFB: [N, sf_K, L] or permuted format - scale factors for B
+//   SFA: [blocked_size_a, L] float8_e4m3 - PRE-BLOCKED scale factors for A
+//   SFB: [blocked_size_b, L] float8_e4m3 - PRE-BLOCKED scale factors for B
 //   C: [M, N, L] float16 output
 //
-// Note: We receive the NON-PERMUTED scale factors (sfa_ref_cpu, sfb_ref_cpu from reference.py)
+// Scale factors should be pre-converted to cuBLAS blocked format using to_blocked_cublas()
 torch::Tensor cublaslt_nvfp4_gemm(
     torch::Tensor A,       // [M, K/2, L] float4_e2m1fn_x2 
     torch::Tensor B,       // [N, K/2, L] float4_e2m1fn_x2
-    torch::Tensor SFA,     // [M, sf_K, L] float8_e4m3 - NON-PERMUTED scale factors
-    torch::Tensor SFB,     // [N, sf_K, L] float8_e4m3 - NON-PERMUTED scale factors
+    torch::Tensor SFA,     // [blocked_size_a, L] float8_e4m3 - PRE-BLOCKED
+    torch::Tensor SFB,     // [blocked_size_b, L] float8_e4m3 - PRE-BLOCKED
     torch::Tensor C,       // [M, N, L] float16 output
     float alpha,
     float beta)
 {
+    // Initialize global resources once
+    std::call_once(g_init_flag, initGlobalResources);
+
     const int M = A.size(0);
     const int K = A.size(1) * 2;
     const int L = A.size(2);
     const int N = B.size(0);
-    const int sf_K = K / 16;  // Number of scale factor columns
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Create cuBLASLt handle
-    cublasLtHandle_t ltHandle;
-    checkCublasStatus(cublasLtCreate(&ltHandle));
-
-    // Allocate workspace
-    size_t workspaceSize = 32 * 1024 * 1024;
-    void* workspace;
-    checkCudaStatus(cudaMalloc(&workspace, workspaceSize));
-
-    // Calculate blocked scale factor sizes
-    int sf_a_rows = M;
-    int sf_a_cols = sf_K;
-    int sf_b_rows = N;
-    int sf_b_cols = sf_K;
-    
-    int n_row_blocks_a = ceilDiv(sf_a_rows, 128);
-    int n_col_blocks_a = ceilDiv(sf_a_cols, 4);
-    int blocked_size_a = n_row_blocks_a * n_col_blocks_a * 32 * 16;
-    
-    int n_row_blocks_b = ceilDiv(sf_b_rows, 128);
-    int n_col_blocks_b = ceilDiv(sf_b_cols, 4);
-    int blocked_size_b = n_row_blocks_b * n_col_blocks_b * 32 * 16;
-
-    // Allocate blocked scale factor buffers
-    __nv_fp8_e4m3 *blocked_sfa, *blocked_sfb;
-    checkCudaStatus(cudaMalloc(&blocked_sfa, blocked_size_a * sizeof(__nv_fp8_e4m3)));
-    checkCudaStatus(cudaMalloc(&blocked_sfb, blocked_size_b * sizeof(__nv_fp8_e4m3)));
+    // Get blocked scale factor sizes from the pre-blocked tensors
+    size_t blocked_size_a = SFA.size(0);
+    size_t blocked_size_b = SFB.size(0);
 
     // Batch strides
     size_t a_batch_stride = M * (K / 2);
     size_t b_batch_stride = N * (K / 2);
     size_t c_batch_stride = M * N;
-    size_t sfa_batch_stride = M * sf_K;
-    size_t sfb_batch_stride = N * sf_K;
 
     // Process each batch
     for (int batch = 0; batch < L; ++batch) {
         // Get batch pointers for input data
         const void* a_ptr = static_cast<const char*>(A.data_ptr()) + batch * a_batch_stride;
         const void* b_ptr = static_cast<const char*>(B.data_ptr()) + batch * b_batch_stride;
+        
+        // Scale factors are already in blocked format - just get batch pointers
         const __nv_fp8_e4m3* sfa_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(
-            static_cast<const char*>(SFA.data_ptr())) + batch * sfa_batch_stride;
+            static_cast<const char*>(SFA.data_ptr())) + batch * blocked_size_a;
         const __nv_fp8_e4m3* sfb_ptr = reinterpret_cast<const __nv_fp8_e4m3*>(
-            static_cast<const char*>(SFB.data_ptr())) + batch * sfb_batch_stride;
+            static_cast<const char*>(SFB.data_ptr())) + batch * blocked_size_b;
         __half* c_ptr = reinterpret_cast<__half*>(C.data_ptr<at::Half>()) + batch * c_batch_stride;
 
-        // Convert scale factors to blocked format
-        int threads = 256;
-        int blocks_a = (blocked_size_a + threads - 1) / threads;
-        int blocks_b = (blocked_size_b + threads - 1) / threads;
-        
-        convertScaleFactorsToBlocked<<<blocks_a, threads, 0, stream>>>(
-            sfa_ptr, blocked_sfa, sf_a_rows, sf_a_cols);
-        convertScaleFactorsToBlocked<<<blocks_b, threads, 0, stream>>>(
-            sfb_ptr, blocked_sfb, sf_b_rows, sf_b_cols);
-
-        // Run cuBLASLt matmul
+        // Run cuBLASLt matmul directly - no scale conversion needed!
         LtNvfp4Matmul(
-            ltHandle,
+            g_ltHandle,
             M, N, K,
             alpha,
-            blocked_sfa, a_ptr,
-            blocked_sfb, b_ptr,
+            sfa_ptr, a_ptr,
+            sfb_ptr, b_ptr,
             beta,
             c_ptr,
-            workspace,
-            workspaceSize,
+            g_workspace,
+            g_workspaceSize,
             stream
         );
     }
 
-    cudaStreamSynchronize(stream);
+    // Don't synchronize here - let PyTorch handle it
+    // This allows async execution and proper benchmarking
     
-    // Cleanup
-    cudaFree(blocked_sfa);
-    cudaFree(blocked_sfb);
-    cudaFree(workspace);
-    checkCublasStatus(cublasLtDestroy(ltHandle));
-
     return C;
 }

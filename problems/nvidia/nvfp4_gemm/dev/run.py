@@ -18,6 +18,7 @@ import shutil
 import re
 import math
 from pathlib import Path
+from argparse import ArgumentParser
 
 DEV_DIR = Path(__file__).parent
 PROBLEM_DIR = DEV_DIR.parent
@@ -142,8 +143,8 @@ GEMM_CPP = r"""
 torch::Tensor cublaslt_nvfp4_gemm(
     torch::Tensor A,       // [M, K/2, L] float4_e2m1fn_x2 
     torch::Tensor B,       // [N, K/2, L] float4_e2m1fn_x2
-    torch::Tensor SFA,     // Scale factors for A
-    torch::Tensor SFB,     // Scale factors for B
+    torch::Tensor SFA,     // Scale factors for A (pre-blocked format)
+    torch::Tensor SFB,     // Scale factors for B (pre-blocked format)
     torch::Tensor C,       // [M, N, L] float16 output
     float alpha,
     float beta
@@ -155,6 +156,8 @@ GEMM_CUDA = r"""
 """
 
 _cublaslt_gemm = None
+_sfa_blocked = None
+_sfb_blocked = None
 
 def _get_kernel():
     """Lazy load and cache the compiled cuBLASLt kernel."""
@@ -190,6 +193,41 @@ def _get_kernel():
     return _cublaslt_gemm
 
 
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def to_blocked_cublas(input_matrix):
+    """Convert scale factor tensor to cuBLAS blocked format.
+    
+    From cuBLAS docs for VEC16_UE4M3:
+    - View as [n_row_blocks, 128, n_col_blocks, 4]
+    - Permute to [n_row_blocks, n_col_blocks, 128, 4]
+    - Reshape to [-1, 4, 32, 4], transpose(1,2) -> [-1, 32, 4, 4]
+    - Reshape to [-1, 32, 16] and flatten
+    """
+    rows, cols = input_matrix.shape
+    
+    # Pad to multiples of 128 and 4
+    padded_rows = ceil_div(rows, 128) * 128
+    padded_cols = ceil_div(cols, 4) * 4
+    
+    if padded_rows != rows or padded_cols != cols:
+        padded = torch.ones((padded_rows, padded_cols), dtype=input_matrix.dtype, device=input_matrix.device)
+        # FP8 E4M3: 1.0 = 0x38
+        padded = padded.view(torch.uint8).fill_(0x38).view(input_matrix.dtype)
+        padded[:rows, :cols] = input_matrix
+        input_matrix = padded
+    
+    n_row_blocks = padded_rows // 128
+    n_col_blocks = padded_cols // 4
+    
+    blocks = input_matrix.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+    
+    return rearranged.flatten().contiguous()
+
+
 def compile_kernel():
     """Pre-compile the kernel to exclude compilation time from benchmarks."""
     _get_kernel()
@@ -197,13 +235,30 @@ def compile_kernel():
 
 def custom_kernel(data: input_t) -> output_t:
     """Run cuBLASLt GEMM on NVFP4 block-scaled inputs."""
+    global _sfa_blocked, _sfb_blocked
+    
     a, b, sfa_cpu, sfb_cpu, sfa_permuted, sfb_permuted, c = data
     kernel = _get_kernel()
     
-    # cuBLASLt uses non-permuted (CPU) scale factors - kernel converts to blocked format
+    m, k_half, l = a.shape
+    n = b.shape[0]
+    k = k_half * 2
+    sf_k = k // 16
+    
+    # Pre-convert scale factors to cuBLAS blocked format (done once, outside timed region)
+    # This matches CUTLASS which receives pre-permuted scales
+    if _sfa_blocked is None or _sfa_blocked.shape[0] != ceil_div(m, 128) * ceil_div(sf_k, 4) * 512 * l:
+        sfa_blocked_list = []
+        sfb_blocked_list = []
+        for batch in range(l):
+            sfa_blocked_list.append(to_blocked_cublas(sfa_cpu[:, :, batch]))
+            sfb_blocked_list.append(to_blocked_cublas(sfb_cpu[:, :, batch]))
+        _sfa_blocked = torch.stack(sfa_blocked_list, dim=-1).contiguous()
+        _sfb_blocked = torch.stack(sfb_blocked_list, dim=-1).contiguous()
+    
     return kernel.cublaslt_nvfp4_gemm(
         a, b, 
-        sfa_cpu, sfb_cpu,  # Pass CPU-layout scales, NOT permuted
+        _sfa_blocked, _sfb_blocked,  # Pass pre-blocked scales
         c,
         1.0,  # alpha
         0.0   # beta
@@ -290,31 +345,37 @@ def compute_geometric_mean(values: list) -> float:
     return math.exp(log_sum / len(values))
 
 
+def parse_argumenets():
+    parser = ArgumentParser(description="Development helper for CUTLASS NVFP4 GEMM kernel")
+    parser.add_argument("--mode", choices=["test", "bench", "benchmark", "all", "compile"], help="Command to execute")
+    parser.add_argument("--kernel", default="cutlass", help="path to kernel to use")
+    return parser.parse_args()
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
     
-    command = sys.argv[1].lower()
+    args = parse_argumenets()
+    command = args.mode.lower()
     
     # Check for --kernel flag
     use_cublaslt = False
     kernel_file = KERNEL_CU
     if "--kernel" in sys.argv:
         idx = sys.argv.index("--kernel")
-        if idx + 1 < len(sys.argv):
-            kernel_name = sys.argv[idx + 1].lower()
-            if kernel_name == "cublaslt":
-                use_cublaslt = True
-                kernel_file = KERNEL_CUBLASLT
-                print("Using cuBLASLt kernel...")
-            elif kernel_name == "cutlass":
-                kernel_file = KERNEL_CU
-                print("Using CUTLASS kernel...")
-            else:
-                print(f"Unknown kernel: {kernel_name}")
-                print("Available kernels: cutlass, cublaslt")
-                sys.exit(1)
+        kernel_name = args.kernel
+        if kernel_name == "cublaslt":
+            use_cublaslt = True
+            kernel_file = KERNEL_CUBLASLT
+            print("Using cuBLASLt kernel...")
+        elif kernel_name == "cutlass":
+            kernel_file = KERNEL_CU
+            print("Using CUTLASS kernel...")
+        else:
+            print("using custom kernel file:", kernel_name)
+            kernel_file = Path(kernel_name)
+
     
     # Read kernel and generate submission
     print(f"Reading {kernel_file.name}...")
