@@ -21,7 +21,6 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#include <iostream>
 #include <mutex>
 
 // Helper macros for error checking
@@ -83,8 +82,7 @@ void LtNvfp4Matmul(cublasLtHandle_t ltHandle,
                    const float beta,
                    __half *C,                      // Output: [M, N] FP16
                    void *workspace,
-                   size_t workspaceSize,
-                   cudaStream_t stream) 
+                   size_t workspaceSize) 
 {
     cublasLtMatmulDesc_t operationDesc = NULL;
     cublasLtMatrixLayout_t Adesc = NULL, Bdesc = NULL, Cdesc = NULL;
@@ -137,7 +135,7 @@ void LtNvfp4Matmul(cublasLtHandle_t ltHandle,
 
     // Run matmul (note: B and A swapped in the call)
     checkCublasStatus(cublasLtMatmul(ltHandle, operationDesc, &alpha, B, Adesc, A, Bdesc, &beta, C, Cdesc, C, Cdesc,
-                                     &heuristicResult.algo, workspace, workspaceSize, stream));
+                                     &heuristicResult.algo, workspace, workspaceSize, 0));
 
     // Cleanup
     if (preference) checkCublasStatus(cublasLtMatmulPreferenceDestroy(preference));
@@ -173,8 +171,6 @@ torch::Tensor cublaslt_nvfp4_gemm(
     const int L = A.size(2);
     const int N = B.size(0);
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
     // Get blocked scale factor sizes from the pre-blocked tensors
     size_t blocked_size_a = SFA.size(0);
     size_t blocked_size_b = SFB.size(0);
@@ -207,8 +203,7 @@ torch::Tensor cublaslt_nvfp4_gemm(
             beta,
             c_ptr,
             g_workspace,
-            g_workspaceSize,
-            stream
+            g_workspaceSize
         );
     }
 

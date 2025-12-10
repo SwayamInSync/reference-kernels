@@ -347,7 +347,7 @@ def compute_geometric_mean(values: list) -> float:
 
 def parse_argumenets():
     parser = ArgumentParser(description="Development helper for CUTLASS NVFP4 GEMM kernel")
-    parser.add_argument("--mode", choices=["test", "bench", "benchmark", "all", "compile"], help="Command to execute")
+    parser.add_argument("--mode", choices=["test", "bench", "benchmark", "all", "compile", "leaderboard"], help="Command to execute")
     parser.add_argument("--kernel", default="cutlass", help="path to kernel to use")
     return parser.parse_args()
 
@@ -430,6 +430,9 @@ def main():
         compile_kernel()
         print("Compilation successful!")
         return 0
+    elif command == "leaderboard":
+        re, _ = run_command("bash run.sh leaderboard")
+        return re
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
