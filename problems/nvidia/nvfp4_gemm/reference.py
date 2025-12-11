@@ -103,7 +103,7 @@ def generate_input(
     def create_scale_factor_tensors(l, mn, sf_k):
         # Create the reference scale factor tensor (mn, sf_k, l) on CPU.
         ref_shape = (l, mn, sf_k)
-        ref_permute_order = (1, 2, 0)
+        ref_permute_order = (1, 2, 0)   # (mn, sf_k, l)
         # Init with uint8 tensor, then convert to float8_e4m3fn
         ref_f8_random_int = torch.randint(0, 4, ref_shape, dtype=torch.int8, device='cuda')
         ref_f8_torch_tensor = ref_f8_random_int.to(dtype=torch.float8_e4m3fn)
@@ -114,12 +114,14 @@ def generate_input(
         atom_k = 4
         mma_shape = (
             l,  # batch size
-            ceil_div(mn, atom_m[0] * atom_m[1]),
-            ceil_div(sf_k, atom_k),
-            atom_m[0],
-            atom_m[1],
-            atom_k,
+            ceil_div(mn, atom_m[0] * atom_m[1]),    # (mn / 128) blocks
+            ceil_div(sf_k, atom_k),   # (sf_k / 4) blocks
+            atom_m[0],              # 32
+            atom_m[1],        # 4
+            atom_k,           # 4
         )
+
+        # mma_shape = (l, rest_m, rest_k, 32, 4, 4)
 
         # Reorder scale factor tensor to (32, 4, rest_m, 4, rest_k, l) layout
         # Which is needed by the CuTe customized kernel
