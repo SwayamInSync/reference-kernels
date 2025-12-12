@@ -19,9 +19,12 @@ def to_blocked(input_matrix):
 
     padded = input_matrix
     blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    # blocks: [rest_m, rest_k, 128, 4]
     rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-
-    return rearranged.flatten()
+    # rearranged: [-1, 4, 32, 4] -> [-1, 32, 4, 4] -> [-1, 32, 16]
+    # retun a 1D because cuBLAS does not expect a shaped tensor,
+    # it expects 1D raw byte tensor which it will interpret based internal layout expectation
+    return rearranged.flatten() # 1D tensor (contiguous in memory)
 
 
 def ref_kernel(
@@ -140,10 +143,24 @@ def generate_input(
         
         # Create meshgrid for all combinations of (i, j, b)
         i_grid, j_grid, b_grid = torch.meshgrid(i_idx, j_idx, b_idx, indexing='ij')
+
+        """
+        Idea:
+            - Scaling factor matrix is represented as 128x4 blocks
+            - Each 128x4 block is further divided into 32x4 sub-blocks
+
+            # For original position (i, j):
+            mm   = i // 128                  # Which 128-row tile (for matrices > 128 rows) (rest_m blocks)
+            mm32 = i % 32                    # Which row within the 32-row sub-block (0-31)
+            mm4  = (i % 128) // 32           # Which sub-block (0, 1, 2, or 3)
+                                             Each row-th index is in [0, 127] and this is further divided into 4 sub-blocks of 32 rows each
+            kk4  = j % 4                     # Which column within the 4-col tile (0-3)
+            kk   = j // 4                    # Which 4-col tile (for matrices > 4 cols)
+                    """
         
         # Calculate target indices in vectorized manner
-        mm = i_grid // (atom_m[0] * atom_m[1])
-        mm32 = i_grid % atom_m[0]
+        mm = i_grid // (atom_m[0] * atom_m[1])  # rest_m blocks
+        mm32 = i_grid % atom_m[0]   # row position inside 32-block
         mm4 = (i_grid % 128) // atom_m[0]
         kk = j_grid // atom_k
         kk4 = j_grid % atom_k
@@ -155,6 +172,7 @@ def generate_input(
 
     sf_k = ceil_div(k, sf_vec_size)
     sfa_ref_cpu, sfa_ref_permuted = create_scale_factor_tensors(l, m, sf_k)
+    # (n, sf_k, l) and (32, 4, rest_n, 4, rest_k, l)
     sfb_ref_cpu, sfb_ref_permuted = create_scale_factor_tensors(l, n, sf_k)
 
     return (a_ref, b_ref, sfa_ref_cpu.to("cuda"), sfb_ref_cpu.to("cuda"), sfa_ref_permuted, sfb_ref_permuted, c_ref)
