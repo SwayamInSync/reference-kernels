@@ -74,13 +74,6 @@ static void* g_sfb_blocked = nullptr;
 static size_t g_sfa_blocked_size = 0;
 static size_t g_sfb_blocked_size = 0;
 
-// Track last converted scale factor inputs to skip redundant conversions
-static const void* g_last_sfa_input = nullptr;
-static const void* g_last_sfb_input = nullptr;
-static int g_last_M = 0;
-static int g_last_N = 0;
-static int g_last_sf_k = 0;
-
 // Cached algorithm and descriptors for specific problem sizes
 struct CachedPlan {
     cublasLtMatmulDesc_t operationDesc;
@@ -88,8 +81,6 @@ struct CachedPlan {
     cublasLtMatrixLayout_t Bdesc;
     cublasLtMatrixLayout_t Cdesc;
     cublasLtMatmulAlgo_t algo;
-    void* last_sfa;  // Track last used scale pointers
-    void* last_sfb;
     bool valid;
 };
 
@@ -325,8 +316,6 @@ CachedPlan& getOrCreatePlan(int m, int n, int k, const void* sfa_temp, const voi
     }
     
     plan.algo = heuristicResult.algo;
-    plan.last_sfa = nullptr;
-    plan.last_sfb = nullptr;
     plan.valid = true;
     
     return plan;
@@ -377,20 +366,8 @@ torch::Tensor cublaslt_nvfp4_gemm(
     void* sfa_output_0 = g_sfa_blocked;
     void* sfb_output_0 = g_sfb_blocked;
     
-    // Only convert if input pointers or dimensions changed
-    bool need_conversion = (sfa_input_0 != g_last_sfa_input) || 
-                           (sfb_input_0 != g_last_sfb_input) ||
-                           (M != g_last_M) || (N != g_last_N) || (sf_k != g_last_sf_k);
-    
-    if (need_conversion) {
-        // Fused conversion for both A and B scale factors
-        convertBothScaleFactors(sfa_input_0, sfb_input_0, sfa_output_0, sfb_output_0, M, N, sf_k, stream);
-        g_last_sfa_input = sfa_input_0;
-        g_last_sfb_input = sfb_input_0;
-        g_last_M = M;
-        g_last_N = N;
-        g_last_sf_k = sf_k;
-    }
+    // Fused conversion for both A and B scale factors
+    convertBothScaleFactors(sfa_input_0, sfb_input_0, sfa_output_0, sfb_output_0, M, N, sf_k, stream);
     
     // Get or create cached plan for this problem size
     CachedPlan& plan = getOrCreatePlan(M, N, K, sfa_output_0, sfb_output_0);
@@ -412,13 +389,9 @@ torch::Tensor cublaslt_nvfp4_gemm(
         
         __half* c_ptr = reinterpret_cast<__half*>(C.data_ptr<at::Half>()) + batch * c_batch_stride;
 
-        // Only update scale pointers if they changed
-        if (plan.last_sfa != sfa_output || plan.last_sfb != sfb_output) {
-            checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sfb_output, sizeof(sfb_output)));
-            checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfa_output, sizeof(sfa_output)));
-            plan.last_sfa = sfa_output;
-            plan.last_sfb = sfb_output;
-        }
+        // Set scale pointers for this batch (must be done each time as pointers change)
+        checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sfb_output, sizeof(sfb_output)));
+        checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfa_output, sizeof(sfa_output)));
 
         // Run matmul with cached algorithm
         checkCublasStatus(cublasLtMatmul(g_ltHandle, plan.operationDesc, &alpha, 

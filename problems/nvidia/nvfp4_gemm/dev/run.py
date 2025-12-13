@@ -143,8 +143,8 @@ GEMM_CPP = r"""
 torch::Tensor cublaslt_nvfp4_gemm(
     torch::Tensor A,       // [M, K/2, L] float4_e2m1fn_x2 
     torch::Tensor B,       // [N, K/2, L] float4_e2m1fn_x2
-    torch::Tensor SFA,     // Scale factors for A (pre-blocked format)
-    torch::Tensor SFB,     // Scale factors for B (pre-blocked format)
+    torch::Tensor SFA,     // Scale factors for A (CPU layout - converted on GPU)
+    torch::Tensor SFB,     // Scale factors for B (CPU layout - converted on GPU)
     torch::Tensor C,       // [M, N, L] float16 output
     float alpha,
     float beta
@@ -156,8 +156,6 @@ GEMM_CUDA = r"""
 """
 
 _cublaslt_gemm = None
-_sfa_blocked = None
-_sfb_blocked = None
 
 def _get_kernel():
     """Lazy load and cache the compiled cuBLASLt kernel."""
@@ -193,72 +191,24 @@ def _get_kernel():
     return _cublaslt_gemm
 
 
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def to_blocked_cublas(input_matrix):
-    """Convert scale factor tensor to cuBLAS blocked format.
-    
-    From cuBLAS docs for VEC16_UE4M3:
-    - View as [n_row_blocks, 128, n_col_blocks, 4]
-    - Permute to [n_row_blocks, n_col_blocks, 128, 4]
-    - Reshape to [-1, 4, 32, 4], transpose(1,2) -> [-1, 32, 4, 4]
-    - Reshape to [-1, 32, 16] and flatten
-    """
-    rows, cols = input_matrix.shape
-    
-    # Pad to multiples of 128 and 4
-    padded_rows = ceil_div(rows, 128) * 128
-    padded_cols = ceil_div(cols, 4) * 4
-    
-    if padded_rows != rows or padded_cols != cols:
-        padded = torch.ones((padded_rows, padded_cols), dtype=input_matrix.dtype, device=input_matrix.device)
-        # FP8 E4M3: 1.0 = 0x38
-        padded = padded.view(torch.uint8).fill_(0x38).view(input_matrix.dtype)
-        padded[:rows, :cols] = input_matrix
-        input_matrix = padded
-    
-    n_row_blocks = padded_rows // 128
-    n_col_blocks = padded_cols // 4
-    
-    blocks = input_matrix.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
-    rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
-    
-    return rearranged.flatten().contiguous()
-
-
 def compile_kernel():
     """Pre-compile the kernel to exclude compilation time from benchmarks."""
     _get_kernel()
 
 
 def custom_kernel(data: input_t) -> output_t:
-    """Run cuBLASLt GEMM on NVFP4 block-scaled inputs."""
-    global _sfa_blocked, _sfb_blocked
+    """Run cuBLASLt GEMM on NVFP4 block-scaled inputs.
     
+    Scale factor conversion to cuBLAS tiled format is done on GPU for speed.
+    """
     a, b, sfa_cpu, sfb_cpu, sfa_permuted, sfb_permuted, c = data
     kernel = _get_kernel()
     
-    m, k_half, l = a.shape
-    n = b.shape[0]
-    k = k_half * 2
-    sf_k = k // 16
-    
-    # Pre-convert scale factors to cuBLAS blocked format (done once, outside timed region)
-    # This matches CUTLASS which receives pre-permuted scales
-    if _sfa_blocked is None or _sfa_blocked.shape[0] != ceil_div(m, 128) * ceil_div(sf_k, 4) * 512 * l:
-        sfa_blocked_list = []
-        sfb_blocked_list = []
-        for batch in range(l):
-            sfa_blocked_list.append(to_blocked_cublas(sfa_cpu[:, :, batch]))
-            sfb_blocked_list.append(to_blocked_cublas(sfb_cpu[:, :, batch]))
-        _sfa_blocked = torch.stack(sfa_blocked_list, dim=-1).contiguous()
-        _sfb_blocked = torch.stack(sfb_blocked_list, dim=-1).contiguous()
-    
+    # Pass CPU-layout scale factors directly to kernel
+    # The CUDA kernel will convert them to blocked format on GPU (very fast!)
     return kernel.cublaslt_nvfp4_gemm(
         a, b, 
-        _sfa_blocked, _sfb_blocked,  # Pass pre-blocked scales
+        sfa_cpu, sfb_cpu,  # CPU layout - GPU kernel converts them
         c,
         1.0,  # alpha
         0.0   # beta
@@ -380,6 +330,11 @@ def main():
     # Read kernel and generate submission
     print(f"Reading {kernel_file.name}...")
     kernel_code = read_kernel(kernel_file)
+    
+    # Auto-detect cuBLASLt kernel based on content
+    if "cublaslt_nvfp4_gemm" in kernel_code or "cublasLtMatmul" in kernel_code:
+        use_cublaslt = True
+        print("Detected cuBLASLt kernel...")
     
     print("Generating submission.py...")
     submission_content = generate_submission(kernel_code, use_cublaslt)
