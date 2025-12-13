@@ -4,6 +4,7 @@
 // 1. Cache matmul descriptors and algorithm - avoid repeated setup overhead
 // 2. Pre-allocate and reuse scale factor conversion buffers
 // 3. Optimized GPU scale factor conversion kernel with 4-byte coalesced access
+// 4. Skip redundant conversions when input pointers unchanged
 //
 // Key requirements from cuBLAS documentation:
 // 1. A must be transposed (CUBLAS_OP_T), B must be non-transposed (CUBLAS_OP_N) - "TN" format
@@ -16,11 +17,9 @@
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
 
 #include <mutex>
 #include <unordered_map>
-#include <tuple>
 
 #define checkCublasStatus(status) do { \
     if (status != CUBLAS_STATUS_SUCCESS) { \
@@ -53,13 +52,6 @@ static void* g_sfb_blocked = nullptr;
 static size_t g_sfa_blocked_size = 0;
 static size_t g_sfb_blocked_size = 0;
 
-// Track last converted scale factor inputs to skip redundant conversions
-static const void* g_last_sfa_input = nullptr;
-static const void* g_last_sfb_input = nullptr;
-static int g_last_M = 0;
-static int g_last_N = 0;
-static int g_last_sf_k = 0;
-
 // Cached algorithm and descriptors for specific problem sizes
 struct CachedPlan {
     cublasLtMatmulDesc_t operationDesc;
@@ -67,7 +59,7 @@ struct CachedPlan {
     cublasLtMatrixLayout_t Bdesc;
     cublasLtMatrixLayout_t Cdesc;
     cublasLtMatmulAlgo_t algo;
-    void* last_sfa;  // Track last used scale pointers
+    void* last_sfa;
     void* last_sfb;
     bool valid;
 };
@@ -93,7 +85,6 @@ static void ensureScaleBuffers(size_t sfa_size, size_t sfb_size) {
     }
 }
 
-// Hash function for M,N,K tuple
 inline uint64_t makePlanKey(int m, int n, int k) {
     return ((uint64_t)m << 40) | ((uint64_t)n << 20) | (uint64_t)k;
 }
@@ -101,8 +92,6 @@ inline uint64_t makePlanKey(int m, int n, int k) {
 // ============================================================================
 // GPU Scale Factor Conversion - Fused kernel for both A and B
 // ============================================================================
-// Converts both SFA and SFB in a single kernel launch to reduce overhead
-// Each warp handles one complete 128-row tile column (128 rows x 4 cols = 512 bytes)
 
 __global__ void __launch_bounds__(256, 4) convertBothScaleFactorsKernel(
     const uint8_t* __restrict__ inputA,
@@ -115,14 +104,12 @@ __global__ void __launch_bounds__(256, 4) convertBothScaleFactorsKernel(
     const int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int laneId = threadIdx.x % 32;
     
-    // Total tile-columns for A and B combined
     const int total_tile_cols_a = n_row_blocks_a * n_col_blocks;
     const int total_tile_cols_b = n_row_blocks_b * n_col_blocks;
     const int total_tile_cols = total_tile_cols_a + total_tile_cols_b;
     
     if (warpId >= total_tile_cols) return;
     
-    // Determine if we're processing A or B
     const bool is_a = (warpId < total_tile_cols_a);
     const int local_warp = is_a ? warpId : (warpId - total_tile_cols_a);
     const int n_row_blocks = is_a ? n_row_blocks_a : n_row_blocks_b;
@@ -130,14 +117,12 @@ __global__ void __launch_bounds__(256, 4) convertBothScaleFactorsKernel(
     const uint8_t* input = is_a ? inputA : inputB;
     uint8_t* output = is_a ? outputA : outputB;
     
-    // Decompose into tile coordinates
     const int tile_row = local_warp / n_col_blocks;
     const int tile_col = local_warp % n_col_blocks;
     
     const int base_row = tile_row * 128;
     const int base_col = tile_col * 4;
     
-    // Each thread handles 4 consecutive rows
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         const int local_row = laneId * 4 + r;
@@ -157,52 +142,10 @@ __global__ void __launch_bounds__(256, 4) convertBothScaleFactorsKernel(
     }
 }
 
-// Single matrix version for edge cases
-__global__ void __launch_bounds__(256, 4) convertScaleFactorsKernelOpt(
-    const uint8_t* __restrict__ input,
-    uint8_t* __restrict__ output,
-    int rows,
-    int cols,
-    int n_row_blocks,
-    int n_col_blocks
-) {
-    const int warpId = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int laneId = threadIdx.x % 32;
-    
-    const int total_tile_cols = n_row_blocks * n_col_blocks;
-    
-    if (warpId >= total_tile_cols) return;
-    
-    const int tile_row = warpId / n_col_blocks;
-    const int tile_col = warpId % n_col_blocks;
-    
-    const int base_row = tile_row * 128;
-    const int base_col = tile_col * 4;
-    
-    #pragma unroll
-    for (int r = 0; r < 4; r++) {
-        const int local_row = laneId * 4 + r;
-        const int global_row = base_row + local_row;
-        
-        if (global_row < rows) {
-            uint32_t val4 = *reinterpret_cast<const uint32_t*>(
-                input + global_row * cols + base_col
-            );
-            
-            const int outer = local_row;
-            const int tile_offset = (outer % 32) * 16 + (outer / 32) * 4;
-            const int output_offset = warpId * 512 + tile_offset;
-            
-            *reinterpret_cast<uint32_t*>(output + output_offset) = val4;
-        }
-    }
-}
-
 void convertBothScaleFactors(
     const void* inputA, const void* inputB,
     void* outputA, void* outputB,
-    int rowsA, int rowsB, int cols,
-    cudaStream_t stream = 0
+    int rowsA, int rowsB, int cols
 ) {
     int n_row_blocks_a = ceilDiv(rowsA, 128);
     int n_row_blocks_b = ceilDiv(rowsB, 128);
@@ -213,36 +156,13 @@ void convertBothScaleFactors(
     int threadsPerBlock = 256;
     int numBlocks = ceilDiv(warpsNeeded * 32, threadsPerBlock);
     
-    convertBothScaleFactorsKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
+    convertBothScaleFactorsKernel<<<numBlocks, threadsPerBlock>>>(
         static_cast<const uint8_t*>(inputA),
         static_cast<const uint8_t*>(inputB),
         static_cast<uint8_t*>(outputA),
         static_cast<uint8_t*>(outputB),
         rowsA, rowsB, cols,
         n_row_blocks_a, n_row_blocks_b, n_col_blocks
-    );
-}
-
-void convertScaleFactorsToBlockedFormat(
-    const void* input,
-    void* output,
-    int rows, 
-    int cols,
-    cudaStream_t stream = 0
-) {
-    int n_row_blocks = ceilDiv(rows, 128);
-    int n_col_blocks = ceilDiv(cols, 4);
-    
-    int total_tile_cols = n_row_blocks * n_col_blocks;
-    int warpsNeeded = total_tile_cols;
-    int threadsPerBlock = 256;
-    int numBlocks = ceilDiv(warpsNeeded * 32, threadsPerBlock);
-    
-    convertScaleFactorsKernelOpt<<<numBlocks, threadsPerBlock, 0, stream>>>(
-        static_cast<const uint8_t*>(input),
-        static_cast<uint8_t*>(output),
-        rows, cols,
-        n_row_blocks, n_col_blocks
     );
 }
 
@@ -259,33 +179,27 @@ CachedPlan& getOrCreatePlan(int m, int n, int k, const void* sfa_temp, const voi
         return it->second;
     }
     
-    // Create new plan
     CachedPlan& plan = g_plan_cache[key];
     plan.valid = false;
     
     cublasOperation_t transa = CUBLAS_OP_T;
     cublasOperation_t transb = CUBLAS_OP_N;
     
-    // Create operation descriptor
     checkCublasStatus(cublasLtMatmulDescCreate(&plan.operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
     checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
     checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
     
-    // Set block scaling mode
     cublasLtMatmulMatrixScale_t scaleMode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
     checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
     checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleMode, sizeof(scaleMode)));
     
-    // Set temporary scale pointers for heuristic search
     checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sfb_temp, sizeof(sfb_temp)));
     checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfa_temp, sizeof(sfa_temp)));
     
-    // Matrix layouts (swapped A and B for TN format)
     checkCublasStatus(cublasLtMatrixLayoutCreate(&plan.Adesc, CUDA_R_4F_E2M1, k, n, k));
     checkCublasStatus(cublasLtMatrixLayoutCreate(&plan.Bdesc, CUDA_R_4F_E2M1, k, m, k));
     checkCublasStatus(cublasLtMatrixLayoutCreate(&plan.Cdesc, CUDA_R_16F, n, m, n));
     
-    // Get heuristic and cache the algorithm
     cublasLtMatmulPreference_t preference;
     checkCublasStatus(cublasLtMatmulPreferenceCreate(&preference));
     checkCublasStatus(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -315,11 +229,11 @@ CachedPlan& getOrCreatePlan(int m, int n, int k, const void* sfa_temp, const voi
 // Main entry point
 // ============================================================================
 torch::Tensor cublaslt_nvfp4_gemm(
-    torch::Tensor A,       // [M, K/2, L] float4_e2m1fn_x2 
-    torch::Tensor B,       // [N, K/2, L] float4_e2m1fn_x2
-    torch::Tensor SFA,     // [M, K//16, L] float8_e4m3 - CPU layout
-    torch::Tensor SFB,     // [N, K//16, L] float8_e4m3 - CPU layout
-    torch::Tensor C,       // [M, N, L] float16 output
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor SFA,
+    torch::Tensor SFB,
+    torch::Tensor C,
     float alpha,
     float beta)
 {
@@ -331,7 +245,6 @@ torch::Tensor cublaslt_nvfp4_gemm(
     const int N = B.size(0);
     const int sf_k = K / 16;
     
-    // Calculate blocked format sizes
     int n_row_blocks_a = ceilDiv(M, 128);
     int n_col_blocks = ceilDiv(sf_k, 4);
     int n_row_blocks_b = ceilDiv(N, 128);
@@ -341,40 +254,28 @@ torch::Tensor cublaslt_nvfp4_gemm(
     
     ensureScaleBuffers(blocked_size_a * L, blocked_size_b * L);
 
-    // Batch strides
     size_t a_batch_stride = M * (K / 2);
     size_t b_batch_stride = N * (K / 2);
     size_t c_batch_stride = M * N;
     size_t sfa_input_stride = M * sf_k;
     size_t sfb_input_stride = N * sf_k;
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     
-    // Convert first batch's scale factors to have valid pointers for plan creation
     const void* sfa_input_0 = static_cast<const uint8_t*>(SFA.data_ptr());
     const void* sfb_input_0 = static_cast<const uint8_t*>(SFB.data_ptr());
     void* sfa_output_0 = g_sfa_blocked;
     void* sfb_output_0 = g_sfb_blocked;
     
-    // Only convert if input pointers or dimensions changed
-    bool need_conversion = (sfa_input_0 != g_last_sfa_input) || 
-                           (sfb_input_0 != g_last_sfb_input) ||
-                           (M != g_last_M) || (N != g_last_N) || (sf_k != g_last_sf_k);
-    
-    if (need_conversion) {
-        // Fused conversion for both A and B scale factors
-        convertBothScaleFactors(sfa_input_0, sfb_input_0, sfa_output_0, sfb_output_0, M, N, sf_k, stream);
-        g_last_sfa_input = sfa_input_0;
-        g_last_sfb_input = sfb_input_0;
-        g_last_M = M;
-        g_last_N = N;
-        g_last_sf_k = sf_k;
+    // Always convert scale factors - data may change even with same pointers
+    for (int batch = 0; batch < L; ++batch) {
+        const void* sfa_input = static_cast<const uint8_t*>(SFA.data_ptr()) + batch * sfa_input_stride;
+        const void* sfb_input = static_cast<const uint8_t*>(SFB.data_ptr()) + batch * sfb_input_stride;
+        void* sfa_output = static_cast<uint8_t*>(g_sfa_blocked) + batch * blocked_size_a;
+        void* sfb_output = static_cast<uint8_t*>(g_sfb_blocked) + batch * blocked_size_b;
+        convertBothScaleFactors(sfa_input, sfb_input, sfa_output, sfb_output, M, N, sf_k);
     }
     
-    // Get or create cached plan for this problem size
     CachedPlan& plan = getOrCreatePlan(M, N, K, sfa_output_0, sfb_output_0);
 
-    // Process each batch
     for (int batch = 0; batch < L; ++batch) {
         const void* a_ptr = static_cast<const char*>(A.data_ptr()) + batch * a_batch_stride;
         const void* b_ptr = static_cast<const char*>(B.data_ptr()) + batch * b_batch_stride;
@@ -382,16 +283,8 @@ torch::Tensor cublaslt_nvfp4_gemm(
         void* sfa_output = static_cast<uint8_t*>(g_sfa_blocked) + batch * blocked_size_a;
         void* sfb_output = static_cast<uint8_t*>(g_sfb_blocked) + batch * blocked_size_b;
         
-        // Convert scale factors only for batches > 0 (batch 0 was already converted)
-        if (batch > 0) {
-            const void* sfa_input = static_cast<const uint8_t*>(SFA.data_ptr()) + batch * sfa_input_stride;
-            const void* sfb_input = static_cast<const uint8_t*>(SFB.data_ptr()) + batch * sfb_input_stride;
-            convertBothScaleFactors(sfa_input, sfb_input, sfa_output, sfb_output, M, N, sf_k, stream);
-        }
-        
         __half* c_ptr = reinterpret_cast<__half*>(C.data_ptr<at::Half>()) + batch * c_batch_stride;
 
-        // Only update scale pointers if they changed
         if (plan.last_sfa != sfa_output || plan.last_sfb != sfb_output) {
             checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sfb_output, sizeof(sfb_output)));
             checkCublasStatus(cublasLtMatmulDescSetAttribute(plan.operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfa_output, sizeof(sfa_output)));
@@ -399,13 +292,12 @@ torch::Tensor cublaslt_nvfp4_gemm(
             plan.last_sfb = sfb_output;
         }
 
-        // Run matmul with cached algorithm
         checkCublasStatus(cublasLtMatmul(g_ltHandle, plan.operationDesc, &alpha, 
                                          b_ptr, plan.Adesc, 
                                          a_ptr, plan.Bdesc, 
                                          &beta, c_ptr, plan.Cdesc, 
                                          c_ptr, plan.Cdesc,
-                                         &plan.algo, g_workspace, g_workspaceSize, stream));
+                                         &plan.algo, g_workspace, g_workspaceSize, 0));
     }
 
     return C;
