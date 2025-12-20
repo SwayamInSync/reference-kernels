@@ -66,9 +66,9 @@ def _get_kernel():
             sys.stderr = io.StringIO()
         try:
             # CUTLASS include paths - adjust if needed for your environment
-            cutlass_include = "/workspace/cutlass/include"
-            cutlass_tools_include = "/workspace/cutlass/tools/util/include"
-            
+            cutlass_include = "/root/cutlass/include"
+            cutlass_tools_include = "/root/cutlass/tools/util/include"
+
             _cutlass_gemm = load_inline(
                 name="cutlass_nvfp4_gemm",
                 cpp_sources=[GEMM_CPP],
