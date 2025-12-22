@@ -1,9 +1,11 @@
 rm -rf __pycache__ 
 rm -rf ~/.cache/torch_extensions
 mode=$1
+eval_file=eval_better_bench.py
 
-if [ "$mode" = "benchmark" ]; then
-    CUDA_VISIBLE_DEVICES=0 POPCORN_FD=1 CUTE_DSL_ARCH=sm_100a python eval.py $mode task.yml | tee /tmp/benchmark_output.txt
+# compute mean for benchmark and leaderboard modes
+if [ "$mode" = "benchmark" ] || [ "$mode" = "leaderboard" ]; then
+    CUDA_VISIBLE_DEVICES=0 POPCORN_FD=1 CUTE_DSL_ARCH=sm_100a python $eval_file $mode task.yml | tee /tmp/benchmark_output.txt
     
     # Extract mean values and compute geometric mean
     echo ""
@@ -33,5 +35,5 @@ if [ "$mode" = "benchmark" ]; then
     echo "Geometric Mean: $geomean ns"
     echo "============================="
 else
-    CUDA_VISIBLE_DEVICES=0 POPCORN_FD=1 CUTE_DSL_ARCH=sm_100a python eval.py $mode task.yml
+    CUDA_VISIBLE_DEVICES=0 POPCORN_FD=1 CUTE_DSL_ARCH=sm_100a python $eval_file $mode task.yml
 fi
