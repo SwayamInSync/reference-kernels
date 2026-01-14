@@ -6,6 +6,16 @@ import time
 import os
 import sys
 import math
+
+# Disable CuTe DSL file caching for more stable benchmarking
+os.environ["CUTE_DSL_DISABLE_FILE_CACHING"] = "1"
+
+
+def _init_worker():
+    """Initialize worker process with correct env vars."""
+    os.environ["CUTE_DSL_DISABLE_FILE_CACHING"] = "1"
+
+
 from pathlib import Path
 from typing import Any, Optional
 
@@ -459,18 +469,20 @@ def main():
         import multiprocessing
 
         mp_context = multiprocessing.get_context("spawn")
-        with mp_context.Pool(1) as pool:
+        with mp_context.Pool(1, initializer=_init_worker) as pool:
             if mode == "test":
                 return run_testing(logger, pool, tests)
             if mode == "benchmark":
                 return run_benchmarking(logger, pool, tests)
 
             if mode == "leaderboard":
-                run_single_benchmark(pool, tests[0], False, 200, 1e7)
+                # Warmup all test shapes to ensure consistent benchmarking
+                for test in tests:
+                    run_single_benchmark(pool, test, False, 1000, 5e8)
                 logger.log("benchmark-count", len(tests))
                 passed = True
                 for i in range(len(tests)):
-                    result = run_single_benchmark(pool, tests[i], True, 200, 30e9)
+                    result = run_single_benchmark(pool, tests[i], True, 1000, 30e9)
                     logger.log(f"benchmark.{i}.spec", tests[i].spec)
                     if isinstance(result, Stats):
                         for field in dataclasses.fields(Stats):
