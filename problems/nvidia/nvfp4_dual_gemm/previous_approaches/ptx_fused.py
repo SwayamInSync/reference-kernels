@@ -14,7 +14,11 @@ import torch
 from task import input_t, output_t
 from torch.utils.cpp_extension import load_inline
 
-# Fused dual GEMM kernel: loads A once, computes A@B1.T and A@B2.T, fuses silu in epilogue
+# Fused dual GEMM kernel implementing the LeftSiLUAndMul epilogue pattern from CUTLASS:
+# D0 = A @ B0.T
+# D1 = A @ B1.T  
+# D2 = silu(D0) * D1
+# This follows the CUTLASS 45_dual_gemm example with LeftSiLUAndMul epilogue
 src = """
 #include <cudaTypedefs.h>
 #include <cuda_fp16.h>
@@ -89,28 +93,6 @@ void tcgen05_cp_nvfp4(int taddr, uint64_t s_desc) {
   asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;" :: "r"(taddr), "l"(s_desc));
 }
 
-// MMA instruction that writes to a specific TMEM offset
-__device__ inline
-void tcgen05_mma_nvfp4_offset(
-  uint64_t a_desc,
-  uint64_t b_desc,
-  uint32_t i_desc,
-  int scale_A_tmem,
-  int scale_B_tmem,
-  int enable_input_d,
-  int d_tmem_offset
-) {
-  asm volatile(
-    "{\\n\\t"
-    ".reg .pred p;\\n\\t"
-    "setp.ne.b32 p, %6, 0;\\n\\t"
-    "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [%0], %1, %2, %3, [%4], [%5], p;\\n\\t"
-    "}"
-    :: "r"(d_tmem_offset), "l"(a_desc), "l"(b_desc), "r"(i_desc),
-       "r"(scale_A_tmem), "r"(scale_B_tmem), "r"(enable_input_d)
-  );
-}
-
 // MMA with collector::a::fill - loads A into collector buffer for reuse
 __device__ inline
 void tcgen05_mma_nvfp4_fill(
@@ -155,32 +137,10 @@ void tcgen05_mma_nvfp4_lastuse(
   );
 }
 
-// Standard MMA (d_tmem = 0)
-__device__ inline
-void tcgen05_mma_nvfp4(
-  uint64_t a_desc,
-  uint64_t b_desc,
-  uint32_t i_desc,
-  int scale_A_tmem,
-  int scale_B_tmem,
-  int enable_input_d
-) {
-  const int d_tmem = 0;  // assume
-  asm volatile(
-    "{\\n\\t"
-    ".reg .pred p;\\n\\t"
-    "setp.ne.b32 p, %6, 0;\\n\\t"
-    "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 [%0], %1, %2, %3, [%4], [%5], p;\\n\\t"
-    "}"
-    :: "r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(i_desc),
-       "r"(scale_A_tmem), "r"(scale_B_tmem), "r"(enable_input_d)
-  );
-}
-
-// see https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html
+// TMEM load templates for reading accumulators
 struct SHAPE {
-  static constexpr char _32x32b[]  = ".32x32b";   // 32x1 tile for each warp
-  static constexpr char _16x256b[] = ".16x256b";  // 16x8 tile
+  static constexpr char _32x32b[]  = ".32x32b";
+  static constexpr char _16x256b[] = ".16x256b";
 };
 
 struct NUM {
@@ -241,49 +201,6 @@ void tcgen05_ld_64regs(float *tmp, int row, int col) {
               : "r"((row << 16) | col), "C"(SHAPE), "C"(NUM));
 }
 
-template <const char *SHAPE, const char *NUM>
-__device__ inline
-void tcgen05_ld_128regs(float *tmp, int row, int col) {
-  asm volatile("tcgen05.ld.sync.aligned%129%130.b32 "
-              "{ %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
-              "  %8,  %9, %10, %11, %12, %13, %14, %15, "
-              " %16, %17, %18, %19, %20, %21, %22, %23, "
-              " %24, %25, %26, %27, %28, %29, %30, %31, "
-              " %32, %33, %34, %35, %36, %37, %38, %39, "
-              " %40, %41, %42, %43, %44, %45, %46, %47, "
-              " %48, %49, %50, %51, %52, %53, %54, %55, "
-              " %56, %57, %58, %59, %60, %61, %62, %63, "
-              " %64, %65, %66, %67, %68, %69, %70, %71, "
-              " %72, %73, %74, %75, %76, %77, %78, %79, "
-              " %80, %81, %82, %83, %84, %85, %86, %87, "
-              " %88, %89, %90, %91, %92, %93, %94, %95, "
-              " %96, %97, %98, %99,%100,%101,%102,%103, "
-              "%104,%105,%106,%107,%108,%109,%110,%111, "
-              "%112,%113,%114,%115,%116,%117,%118,%119, "
-              "%120,%121,%122,%123,%124,%125,%126,%127}, [%128];"
-              : "=f"(tmp[ 0]), "=f"(tmp[ 1]), "=f"(tmp[ 2]), "=f"(tmp[ 3]), "=f"(tmp[ 4]), "=f"(tmp[ 5]), "=f"(tmp[ 6]), "=f"(tmp[ 7]),
-                "=f"(tmp[ 8]), "=f"(tmp[ 9]), "=f"(tmp[10]), "=f"(tmp[11]), "=f"(tmp[12]), "=f"(tmp[13]), "=f"(tmp[14]), "=f"(tmp[15]),
-                "=f"(tmp[16]), "=f"(tmp[17]), "=f"(tmp[18]), "=f"(tmp[19]), "=f"(tmp[20]), "=f"(tmp[21]), "=f"(tmp[22]), "=f"(tmp[23]),
-                "=f"(tmp[24]), "=f"(tmp[25]), "=f"(tmp[26]), "=f"(tmp[27]), "=f"(tmp[28]), "=f"(tmp[29]), "=f"(tmp[30]), "=f"(tmp[31]),
-                "=f"(tmp[32]), "=f"(tmp[33]), "=f"(tmp[34]), "=f"(tmp[35]), "=f"(tmp[36]), "=f"(tmp[37]), "=f"(tmp[38]), "=f"(tmp[39]),
-                "=f"(tmp[40]), "=f"(tmp[41]), "=f"(tmp[42]), "=f"(tmp[43]), "=f"(tmp[44]), "=f"(tmp[45]), "=f"(tmp[46]), "=f"(tmp[47]),
-                "=f"(tmp[48]), "=f"(tmp[49]), "=f"(tmp[50]), "=f"(tmp[51]), "=f"(tmp[52]), "=f"(tmp[53]), "=f"(tmp[54]), "=f"(tmp[55]),
-                "=f"(tmp[56]), "=f"(tmp[57]), "=f"(tmp[58]), "=f"(tmp[59]), "=f"(tmp[60]), "=f"(tmp[61]), "=f"(tmp[62]), "=f"(tmp[63]),
-                "=f"(tmp[64]), "=f"(tmp[65]), "=f"(tmp[66]), "=f"(tmp[67]), "=f"(tmp[68]), "=f"(tmp[69]), "=f"(tmp[70]), "=f"(tmp[71]),
-                "=f"(tmp[72]), "=f"(tmp[73]), "=f"(tmp[74]), "=f"(tmp[75]), "=f"(tmp[76]), "=f"(tmp[77]), "=f"(tmp[78]), "=f"(tmp[79]),
-                "=f"(tmp[80]), "=f"(tmp[81]), "=f"(tmp[82]), "=f"(tmp[83]), "=f"(tmp[84]), "=f"(tmp[85]), "=f"(tmp[86]), "=f"(tmp[87]),
-                "=f"(tmp[88]), "=f"(tmp[89]), "=f"(tmp[90]), "=f"(tmp[91]), "=f"(tmp[92]), "=f"(tmp[93]), "=f"(tmp[94]), "=f"(tmp[95]),
-                "=f"(tmp[96]), "=f"(tmp[97]), "=f"(tmp[98]), "=f"(tmp[99]), "=f"(tmp[100]),"=f"(tmp[101]),"=f"(tmp[102]),"=f"(tmp[103]),
-                "=f"(tmp[104]),"=f"(tmp[105]),"=f"(tmp[106]),"=f"(tmp[107]),"=f"(tmp[108]),"=f"(tmp[109]),"=f"(tmp[110]),"=f"(tmp[111]),
-                "=f"(tmp[112]),"=f"(tmp[113]),"=f"(tmp[114]),"=f"(tmp[115]),"=f"(tmp[116]),"=f"(tmp[117]),"=f"(tmp[118]),"=f"(tmp[119]),
-                "=f"(tmp[120]),"=f"(tmp[121]),"=f"(tmp[122]),"=f"(tmp[123]),"=f"(tmp[124]),"=f"(tmp[125]),"=f"(tmp[126]),"=f"(tmp[127])
-              : "r"((row << 16) | col), "C"(SHAPE), "C"(NUM));
-}
-
-__device__ inline void tcgen05_ld_32x32bx32(float *tmp, int row, int col) { tcgen05_ld_32regs<SHAPE::_32x32b, NUM::x32>(tmp, row, col); }
-__device__ inline void tcgen05_ld_32x32bx64(float *tmp, int row, int col) { tcgen05_ld_64regs<SHAPE::_32x32b, NUM::x64>(tmp, row, col); }
-__device__ inline void tcgen05_ld_32x32bx128(float *tmp, int row, int col) { tcgen05_ld_128regs<SHAPE::_32x32b, NUM::x128>(tmp, row, col); }
-
 __device__ inline void tcgen05_ld_16x256bx4(float *tmp, int row, int col) { tcgen05_ld_16regs<SHAPE::_16x256b, NUM::x4>(tmp, row, col); }
 __device__ inline void tcgen05_ld_16x256bx8(float *tmp, int row, int col) { tcgen05_ld_32regs<SHAPE::_16x256b, NUM::x8>(tmp, row, col); }
 __device__ inline void tcgen05_ld_16x256bx16(float *tmp, int row, int col) { tcgen05_ld_64regs<SHAPE::_16x256b, NUM::x16>(tmp, row, col); }
@@ -326,13 +243,16 @@ void init_AB_tmap(
 }
 
 // ====================================================================================
-// FUSED DUAL GEMM KERNEL
-// This kernel computes C = silu(A @ B1.T) * (A @ B2.T) in a single pass
-// Key optimizations:
-// - A is loaded once and reused for both B1 and B2 computations
-// - Both B1 and B2 are loaded into shared memory (doubled B size)
-// - Two separate TMEM regions for accumulators D1 and D2
-// - silu fusion happens in the epilogue
+// FUSED DUAL GEMM KERNEL - Implements LeftSiLUAndMul from CUTLASS
+// Computes: C = silu(A @ B1.T) * (A @ B2.T)
+// 
+// This is equivalent to the CUTLASS dual_gemm example with:
+// - EpilogueOutputOp0 = identity (or LinearCombination with alpha=1, beta=0)
+// - EpilogueOutputOp1 = identity (or LinearCombination with alpha=1, beta=0)
+// - EpilogueOutputOp2 = LeftSiLUAndMul
+//
+// The LeftSiLUAndMul functor computes: silu(lhs) * rhs
+// where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
 // ====================================================================================
 template <
   int K,
@@ -387,8 +307,8 @@ void fused_dual_gemm_kernel(
   const int mainloop_mbar_addr = mma_mbar_addr + NUM_STAGES * 8;
 
   // TMEM layout for fused dual GEMM:
-  // D1 accumulator: columns 0 to BLOCK_N*2-1 (128 columns for BLOCK_N=64)
-  // D2 accumulator: columns BLOCK_N*2 to BLOCK_N*4-1
+  // D1 accumulator: columns 0 to BLOCK_N*2-1 (stores A @ B1.T result)
+  // D2 accumulator: columns BLOCK_N*2 to BLOCK_N*4-1 (stores A @ B2.T result)
   // SFA: after D2
   // SFB1, SFB2: after SFA
   constexpr int D1_tmem = 0;
@@ -461,6 +381,7 @@ void fused_dual_gemm_kernel(
   }
   else if (warp_id == NUM_WARPS - 1 && elect_sync()) {
     // MMA warp - issues MMA for both D1 (A@B1) and D2 (A@B2)
+    // Uses collector buffer to reuse A data for both MMAs
     constexpr int MMA_N = BLOCK_N;
     constexpr int MMA_M = 128;
     constexpr uint32_t i_desc = (1U << 7U)   // atype=E2M1
@@ -496,7 +417,7 @@ void fused_dual_gemm_kernel(
       const uint64_t SFB1_desc = SF_desc + ((uint64_t)SFB1_smem >> 4ULL);
       const uint64_t SFB2_desc = SF_desc + ((uint64_t)SFB2_smem >> 4ULL);
 
-      // Copy scale factors to TMEM
+      // Copy all scale factors first for better overlap
       for (int k = 0; k < BLOCK_K / MMA_K; k++) {
         uint64_t sfa_desc = SFA_desc + (uint64_t)k * (512ULL >> 4ULL);
         uint64_t sfb1_desc = SFB1_desc + (uint64_t)k * (512ULL >> 4ULL);
@@ -536,7 +457,8 @@ void fused_dual_gemm_kernel(
                 :: "r"(mainloop_mbar_addr) : "memory");
   }
   else if (tid < BLOCK_M) {
-    // Epilogue warps - fuse silu: C = silu(D1) * D2
+    // Epilogue warps - Apply LeftSiLUAndMul: C = silu(D1) * D2
+    // This implements the same computation as CUTLASS LeftSiLUAndMul epilogue functor
 
     mbarrier_wait(mainloop_mbar_addr, 0);
     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -563,26 +485,27 @@ void fused_dual_gemm_kernel(
         asm volatile("tcgen05.wait::ld.sync.aligned;");
       }
 
-      // Apply silu and multiply, then store to fp16
+      // Apply LeftSiLUAndMul: silu(tmp1) * tmp2, then store as fp16
+      // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
       for (int i = 0; i < BLOCK_N / 8; i++) {
         const int row = off_m + warp_id * 32 + m * 16 + lane_id / 4;
         const int col = off_n + i * 8 + (lane_id % 4) * 2;
 
         // Compute silu(tmp1) * tmp2 for each element pair
         float x0 = tmp1[i * 4 + 0], x1 = tmp1[i * 4 + 1], x2 = tmp1[i * 4 + 2], x3 = tmp1[i * 4 + 3];
-        float silu0 = x0 / (1.0f + expf(-x0));
-        float silu1 = x1 / (1.0f + expf(-x1));
-        float silu2 = x2 / (1.0f + expf(-x2));
-        float silu3 = x3 / (1.0f + expf(-x3));
+        
+        // Use fast intrinsics for sigmoid: 1/(1+exp(-x))
+        float sig0 = __fdividef(1.0f, 1.0f + __expf(-x0));
+        float sig1 = __fdividef(1.0f, 1.0f + __expf(-x1));
+        float sig2 = __fdividef(1.0f, 1.0f + __expf(-x2));
+        float sig3 = __fdividef(1.0f, 1.0f + __expf(-x3));
 
-        float out0 = silu0 * tmp2[i * 4 + 0];
-        float out1 = silu1 * tmp2[i * 4 + 1];
-        float out2 = silu2 * tmp2[i * 4 + 2];
-        float out3 = silu3 * tmp2[i * 4 + 3];
+        half2 out01 = __float22half2_rn({x0 * sig0 * tmp2[i * 4 + 0], x1 * sig1 * tmp2[i * 4 + 1]});
+        half2 out23 = __float22half2_rn({x2 * sig2 * tmp2[i * 4 + 2], x3 * sig3 * tmp2[i * 4 + 3]});
 
         // Store as half2
-        reinterpret_cast<half2 *>(C_ptr + (row + 0) * N + col)[0] = __float22half2_rn({out0, out1});
-        reinterpret_cast<half2 *>(C_ptr + (row + 8) * N + col)[0] = __float22half2_rn({out2, out3});
+        reinterpret_cast<half2 *>(C_ptr + (row + 0) * N + col)[0] = out01;
+        reinterpret_cast<half2 *>(C_ptr + (row + 8) * N + col)[0] = out23;
       }
     }
 
@@ -656,15 +579,15 @@ at::Tensor dual_gemm(
   const int M = A.size(0);
   const int N = B1.size(0);
 
-#define LAUNCH(K_, N_min, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES) \
-  else if (K == K_ && N >= N_min && (N % BLOCK_N) == 0) { \
-    fused_dual_gemm_launch<K_, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES>(A, B1, B2, SFA, SFB1, SFB2, C); \
+#define LAUNCH(K_, N_min, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES) \\
+  else if (K == K_ && N >= N_min && (N % BLOCK_N) == 0) { \\
+    fused_dual_gemm_launch<K_, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES>(A, B1, B2, SFA, SFB1, SFB2, C); \\
   }
 
   if (false) {}
-  // Benchmark cases: K=7168, N>=3072 - 5 stages for better latency hiding
+  // Benchmark cases: K=7168, N>=3072 - BLOCK_K=256 with 5 stages
   LAUNCH( 7168, 3072, 128, 64, 256, 5)
-  // Benchmark cases: K=4096, N>=3072 - 5 stages  
+  // Benchmark cases: K=4096, N>=3072 - BLOCK_K=256 with 5 stages
   LAUNCH( 4096, 3072, 128, 64, 256, 5)
   // Fallback for other cases
   LAUNCH(16384, 64, 128, 64, 256, 4)
@@ -717,7 +640,17 @@ def compile_kernel():
 
 def custom_kernel(data: input_t) -> output_t:
     """
-    Fused Dual GEMM with SiLU activation: C = silu(A @ B1.T) * (A @ B2.T)
+    Fused Dual GEMM with SiLU activation implementing LeftSiLUAndMul from CUTLASS.
+    
+    This kernel computes: C = silu(A @ B1.T) * (A @ B2.T)
+    
+    The implementation follows the CUTLASS dual_gemm example (45_dual_gemm) where:
+    - D0 = A @ B0.T (first GEMM)
+    - D1 = A @ B1.T (second GEMM)  
+    - D2 = LeftSiLUAndMul(D0, D1) = silu(D0) * D1
+    
+    The LeftSiLUAndMul functor computes: silu(lhs) * rhs
+    where silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
     """
     a, b1, b2, sfa, sfb1, sfb2, sfa_permuted, sfb1_permuted, sfb2_permuted, c = data
     
